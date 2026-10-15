@@ -25,6 +25,8 @@
  *   - Every changed package must have its version bumped, otherwise nothing is built or published.
  *   - All changed packages are built and verified before the first one is published.
  *   - Re-running a build is safe: a version that already exists in Nexus is skipped (build turns UNSTABLE).
+ *   - "Since the last successful build" = the newest earlier build that finished SUCCESS or UNSTABLE.
+ *     Each build records its commit in its description ("Commit: <sha>"), which is where the next build reads it.
  *   - The result is e-mailed. Runs that changed no package send no e-mail unless they fail.
  *
  * Job setup: Pipeline (script from SCM or pasted), trigger = Poll SCM. This script checks out the
@@ -83,7 +85,9 @@ pipeline {
                             ]
                     ])
                     env.HEAD_COMMIT = scmVars.GIT_COMMIT
-                    env.PREV_SUCCESS_COMMIT = scmVars.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: ''
+                    // Read the baseline BEFORE this build writes its own description.
+                    env.PREV_SUCCESS_COMMIT = lastReleasedCommit()
+                    currentBuild.description = "Commit: ${env.HEAD_COMMIT}"
                 }
             }
         }
@@ -126,18 +130,26 @@ pipeline {
                 script {
                     env.CURRENT_STAGE = 'Validate Version Bumps'
                     def errors = []
+                    def bad = []
+                    def info = []
                     dir(env.REPO_DIR) {
                         for (name in env.CHANGED_PKGS.split(',')) {
                             def v = versions(name)
                             echo "${name}: ${v[0]} -> ${v[1]}"
+                            info << "${name}|${v[0]}|${v[1]}".toString()
                             if (v[0] == v[1]) {
                                 errors << "${name}: version was not bumped (still ${v[1]})"
+                                bad << name
                             } else if (!isNewer(v[0], v[1])) {
                                 errors << "${name}: version went backwards (${v[0]} -> ${v[1]})"
+                                bad << name
                             }
                         }
                     }
+                    env.VERSION_INFO = info.join(';')
                     if (errors) {
+                        env.BAD_PKGS = bad.join(',')
+                        env.FAIL_REASON = errors.join('\n')
                         error("Version check failed. Nothing was built or published.\n - " + errors.join('\n - '))
                     }
                 }
@@ -277,47 +289,117 @@ def appendTo(String list, String item) {
     return list ? "${list},${item}" : item
 }
 
-// E-mails the result. A run that changed no package is silent unless it failed.
+// Commit of the newest earlier build that finished SUCCESS or UNSTABLE ('' if there is none).
+// (The git plugin's GIT_PREVIOUS_SUCCESSFUL_COMMIT ignores UNSTABLE builds, so we keep our own record.)
+def lastReleasedCommit() {
+    def b = currentBuild.previousBuild
+    while (b != null) {
+        if ((b.result == 'SUCCESS' || b.result == 'UNSTABLE') && b.description?.startsWith('Commit: ')) {
+            return b.description.substring(8).trim()
+        }
+        b = b.previousBuild
+    }
+    return ''
+}
+
+// true when item is one of the comma separated names in csv
+def inList(String csv, String item) {
+    return csv ? csv.split(',').any { it == item } : false
+}
+
+def esc(String s) {
+    return (s ?: '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+}
+
+def shortSha(String s) {
+    return s ? (s.length() > 8 ? s.substring(0, 8) : s) : '?'
+}
+
+// E-mails the result as a structured HTML mail. A run that changed no package is silent unless it failed.
+// A problem while building the mail must never change the result of the release, hence the try/catch.
 def notifyBuild(String result) {
     if (result != 'FAILURE' && env.BUILD_ANY != 'true') {
         return
     }
-    def changed = env.CHANGED_PKGS ?: '(none)'
-    def published = env.PUBLISHED_PKGS ?: '(none)'
-    def skipped = env.SKIPPED_PKGS ?: '(none)'
-    def remaining = []
-    if (env.CHANGED_PKGS) {
-        for (p in env.CHANGED_PKGS.split(',')) {
-            if (!(published.split(',').contains(p)) && !(skipped.split(',').contains(p))) {
-                remaining << p
+    try {
+        def colors = [SUCCESS: '#2e7d32', UNSTABLE: '#b26a00', FAILURE: '#c62828']
+        def accent = colors[result] ?: '#444444'
+        def published = env.PUBLISHED_PKGS ?: ''
+        def skipped = env.SKIPPED_PKGS ?: ''
+        def bad = env.BAD_PKGS ?: ''
+
+        def verMap = [:]
+        for (item in (env.VERSION_INFO ?: '').split(';')) {
+            def f = item.split('\\|')
+            if (f.length == 3) {
+                verMap[f[0]] = esc(f[1]) + ' &rarr; ' + esc(f[2])
             }
         }
+
+        def cell = 'padding:6px 12px;border:1px solid #dddddd;'
+        def rows = ''
+        if (env.CHANGED_PKGS) {
+            for (p in env.CHANGED_PKGS.split(',')) {
+                def status = 'Not published'
+                def statusColor = '#555555'
+                if (inList(published, p)) {
+                    status = 'Published'
+                    statusColor = '#2e7d32'
+                } else if (inList(skipped, p)) {
+                    status = 'Skipped (version already in Nexus)'
+                    statusColor = '#b26a00'
+                } else if (inList(bad, p)) {
+                    status = 'Version problem'
+                    statusColor = '#c62828'
+                }
+                rows += """<tr><td style="${cell}"><b>${p}</b></td><td style="${cell}">${verMap[p] ?: '&mdash;'}</td><td style="${cell}color:${statusColor};font-weight:bold;">${status}</td></tr>"""
+            }
+        }
+        def table = rows ? """<table style="border-collapse:collapse;margin:12px 0;"><tr style="background:#f0f0f0;"><th style="${cell}text-align:left;">Package</th><th style="${cell}text-align:left;">Version</th><th style="${cell}text-align:left;">Result</th></tr>${rows}</table>""" : '<p>No package changed.</p>'
+
+        def reason = ''
+        if (env.FAIL_REASON) {
+            reason = """<p style="margin:12px 0 4px 0;"><b>Why it failed</b></p><p style="margin:0;color:#c62828;">${esc(env.FAIL_REASON).replace('\n', '<br>')}</p>"""
+        }
+
+        def action = 'Nothing was published. Check the log, fix the cause and push, or run Build Now.'
+        if (result == 'SUCCESS') {
+            action = 'All changed packages were published.'
+        } else if (result == 'UNSTABLE') {
+            action = 'Some packages were skipped because that version already exists in Nexus. If this is unexpected, check that the version was bumped for the new code.'
+        } else if (env.BAD_PKGS) {
+            action = 'Bump the version in package.json of each package marked "Version problem", then commit and push. The pipeline runs again automatically. Nothing was published.'
+        } else if (env.PUBLISHED_PKGS) {
+            action = 'PARTIAL RELEASE: some packages are already in Nexus. Fix the cause and run Build Now on the same commit; published packages are skipped and the remaining ones are published.'
+        }
+
+        def logTail = ''
+        if (result == 'FAILURE' && !env.BAD_PKGS) {
+            logTail = '<p style="margin:16px 0 4px 0;"><b>Last log lines</b></p>' +
+                    '<pre style="background:#f5f5f5;padding:8px;font-size:12px;white-space:pre-wrap;">' +
+                    '${BUILD_LOG, maxLines=30, escapeHtml=true}' + '</pre>'
+        }
+
+        def body = """<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222222;">
+<h2 style="margin:0 0 8px 0;color:${accent};">UI Components release: ${result}</h2>
+<p style="margin:0 0 4px 0;">Job: <b>${esc(env.JOB_NAME)}</b> &nbsp;|&nbsp; Build: <a href="${env.BUILD_URL}">#${env.BUILD_NUMBER}</a></p>
+<p style="margin:0 0 4px 0;">Stage: <b>${esc(env.CURRENT_STAGE ?: 'unknown')}</b></p>
+<p style="margin:0;">Commits compared: ${shortSha(env.BASE_COMMIT)} &rarr; ${shortSha(env.HEAD_COMMIT)}</p>
+${reason}
+${table}
+<p style="margin:12px 0;"><b>What to do:</b> ${action}</p>
+<p style="margin:0;"><a href="${env.BUILD_URL}console">Open the console log</a> (the full log is attached)</p>
+${logTail}
+</div>"""
+
+        emailext(
+                to: env.NOTIFY_EMAIL,
+                subject: "UI Components release ${result} (${env.JOB_NAME} #${env.BUILD_NUMBER})",
+                mimeType: 'text/html',
+                body: body,
+                attachLog: true
+        )
+    } catch (Exception e) {
+        echo "E-mail could not be sent: ${e}"
     }
-    def hint = ''
-    if (result == 'FAILURE' && env.PUBLISHED_PKGS) {
-        hint = 'PARTIAL RELEASE: some packages are already in Nexus. Fix the cause and run Build Now on the same commit; ' +
-                'published packages are skipped and the remaining ones are published.'
-    } else if (result == 'FAILURE') {
-        hint = 'Nothing was published.'
-    } else if (result == 'UNSTABLE') {
-        hint = 'Some packages were skipped because that version already exists in Nexus.'
-    }
-    emailext(
-            to: env.NOTIFY_EMAIL,
-            subject: "UI Components Release ${result} (build #${env.BUILD_NUMBER})",
-            body: """UI Components release pipeline: ${result}
-
-Failed stage / last stage: ${env.CURRENT_STAGE ?: 'unknown'}
-Changed packages : ${changed}
-Published        : ${published}
-Skipped (exists) : ${skipped}
-Not published    : ${remaining ? remaining.join(',') : '(none)'}
-Compared commits : ${env.BASE_COMMIT ?: '?'} -> ${env.HEAD_COMMIT ?: '?'}
-
-${hint}
-
-Build: ${env.BUILD_URL}
-""",
-            attachLog: true
-    )
 }
